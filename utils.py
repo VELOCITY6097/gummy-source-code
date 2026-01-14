@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 import discord
 from discord.ext import commands
+import certifi  # <--- Added certifi import
 
 # Load environment variables
 load_dotenv()
@@ -35,7 +36,13 @@ def get_db():
 
     if _mongo_client is None:
         try:
-            _mongo_client = MongoClient(MONGO_URI)
+            # Added certifi for SSL certificate verification & TLS options
+            _mongo_client = MongoClient(
+                MONGO_URI, 
+                tls=True, 
+                tlsCAFile=certifi.where()
+            )
+            
             # Verify connection works immediately
             _mongo_client.admin.command('ping')
             logger.info("📦 Connected to MongoDB successfully.")
