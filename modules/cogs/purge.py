@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands
 import asyncio
 import time
-# FIX: Import timezone directly
 from datetime import datetime, timedelta, timezone
 
 class PurgeView(discord.ui.View):
@@ -18,7 +17,8 @@ class PurgeView(discord.ui.View):
         
         self.confirmed = True
         self.disable_all()
-        await interaction.response.edit_message(content="**🗑️ Processing Purge...**", embed=None, view=self)
+        # Edit the existing message to show processing state
+        await interaction.response.edit_message(content="**🗑️ Processing Purge...**", embed=None, view=None)
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
@@ -43,16 +43,16 @@ class Purge(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def purge(self, ctx, amount: int):
         if amount < 1:
-            return await ctx.send("❌ Amount must be greater than 0.")
+            return await ctx.send("❌ Amount must be greater than 0.", ephemeral=True)
         
         if ctx.channel.id in self.active_purges:
-            return await ctx.send("⚠️ A purge is already running in this channel. Please wait.", delete_after=5)
+            return await ctx.send("⚠️ A purge is already running in this channel. Please wait.", ephemeral=True)
 
         # 1. ANALYZE PHASE
+        # We defer immediately so we have a webhook/interaction to edit later
         if ctx.interaction:
             await ctx.defer(ephemeral=True)
         
-        # FIX: Use timezone.utc directly
         two_weeks_ago = datetime.now(timezone.utc) - timedelta(days=14)
         
         msgs_to_analyze = []
@@ -60,10 +60,11 @@ class Purge(commands.Cog):
         link_count = 0
         image_count = 0
         
-        # Scan messages (Limit scan to 500 for preview performance)
         scan_limit = min(amount, 500)
         
-        async for msg in ctx.channel.history(limit=scan_limit):
+        # Determine iterator for history
+        history_iterator = ctx.channel.history(limit=scan_limit)
+        async for msg in history_iterator:
             msgs_to_analyze.append(msg)
             if msg.created_at < two_weeks_ago:
                 old_msgs_count += 1
@@ -92,14 +93,30 @@ class Purge(commands.Cog):
         embed.set_footer(text="Click Confirm to start the robust deletion process.")
         
         view = PurgeView(ctx)
+        
+        # Send the dashboard message
+        # We store 'dashboard_msg' to edit it later if needed (mostly for text commands)
         if ctx.interaction:
-            dashboard = await ctx.interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            dashboard_msg = await ctx.interaction.followup.send(embed=embed, view=view, ephemeral=True)
         else:
-            dashboard = await ctx.send(embed=embed, view=view)
+            dashboard_msg = await ctx.send(embed=embed, view=view)
 
         await view.wait()
 
         if not view.confirmed:
+            # If timed out or cancelled, we stop here.
+            # The view handles the "Cancelled" edit message on button click.
+            # If it timed out, we might want to edit it to say "Timed Out".
+            if ctx.interaction and not view.confirmed:
+                try:
+                    await ctx.interaction.edit_original_response(content="❌ **Purge Timed Out.**", embed=None, view=None)
+                except:
+                    pass
+            elif not ctx.interaction and not view.confirmed:
+                try: 
+                    await dashboard_msg.edit(content="❌ **Purge Timed Out.**", embed=None, view=None)
+                except: 
+                    pass
             return
 
         # 3. EXECUTE PHASE
@@ -130,16 +147,19 @@ class Purge(commands.Cog):
                     value="Some messages were skipped because they are older than 14 days (Discord API Limitation)."
                 )
 
+            # EDIT THE SAME MESSAGE WITH SUCCESS EMBED
             if ctx.interaction:
-                await ctx.interaction.followup.send(embed=success_embed, ephemeral=True)
+                await ctx.interaction.edit_original_response(content=None, embed=success_embed, view=None)
             else:
-                await ctx.send(embed=success_embed, delete_after=10)
-                try: await dashboard.delete()
-                except: pass
+                await dashboard_msg.edit(content=None, embed=success_embed, view=None)
 
         except Exception as e:
-            # Notify Chat
-            await ctx.send(f"❌ Critical Purge Error: {e}", delete_after=10)
+            error_content = f"❌ Critical Purge Error: {e}"
+            if ctx.interaction:
+                await ctx.interaction.edit_original_response(content=error_content, embed=None, view=None)
+            else:
+                await dashboard_msg.edit(content=error_content, embed=None, view=None)
+            
             # Raise so devnoti catches it
             raise e 
         
