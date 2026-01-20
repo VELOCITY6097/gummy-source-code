@@ -1,13 +1,16 @@
-import discord
+﻿import discord
 from discord.ext import commands, tasks
 import datetime
 import psutil
 import math
+import logging
 
 # ─── CONFIG ─────────────────────────────────────────────
 STATUS_CHANNEL_ID = 1390787417463722165
 UPDATE_INTERVAL = 30  # seconds
 # ─────────────────────────────────────────────────────────
+
+logger = logging.getLogger("StatusPage")
 
 class StatusPage(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -20,51 +23,67 @@ class StatusPage(commands.Cog):
 
     # ─── DEBUG COMMAND ────────────────────────────────────
     @commands.command()
+    @commands.is_owner()
     async def teststatus(self, ctx):
+        """Debug command to force-check status system."""
         await ctx.send("🕵️ **Running StatusPage diagnostics...**")
 
         # psutil check
         try:
             cpu = psutil.cpu_percent()
             await ctx.send(f"✅ psutil OK (CPU: {cpu}%)")
-        except Exception:
-            return await ctx.send("❌ psutil missing → `pip install psutil`")
+        except Exception as e:
+            return await ctx.send(f"❌ psutil error: `{e}`")
 
         # channel check
         channel = self.bot.get_channel(STATUS_CHANNEL_ID)
         if not channel:
-            return await ctx.send("❌ Status channel not found")
+            # Try fetching if not in cache (useful for sharded bots)
+            try:
+                channel = await self.bot.fetch_channel(STATUS_CHANNEL_ID)
+            except discord.NotFound:
+                return await ctx.send(f"❌ Status channel ID `{STATUS_CHANNEL_ID}` not found.")
+            except discord.Forbidden:
+                return await ctx.send("❌ Bot does not have access to the status channel.")
 
         await ctx.send(f"✅ Channel found: {channel.mention}")
 
         # permission check
         perms = channel.permissions_for(ctx.guild.me)
         if not perms.send_messages or not perms.embed_links:
-            return await ctx.send("❌ Missing Send Messages / Embed Links permission")
+            return await ctx.send("❌ Missing `Send Messages` or `Embed Links` permission in that channel.")
 
         await ctx.send("✅ Permissions OK — forcing update...")
-        await self.update_status_embed(channel)
-        await ctx.send("✅ Status embed updated")
+        try:
+            await self.update_status_embed(channel)
+            await ctx.send("✅ Status embed updated successfully.")
+        except Exception as e:
+            await ctx.send(f"❌ Update failed: `{e}`")
 
     # ─── TASK LOOP ────────────────────────────────────────
     @tasks.loop(seconds=UPDATE_INTERVAL)
     async def status_task(self):
-        channel = self.bot.get_channel(STATUS_CHANNEL_ID)
-        if not channel:
-            print(f"[StatusPage] ❌ Cannot find channel {STATUS_CHANNEL_ID}")
+        # Wait for bot to be fully ready to avoid cache issues
+        if not self.bot.is_ready():
             return
 
-        await self.update_status_embed(channel)
+        channel = self.bot.get_channel(STATUS_CHANNEL_ID)
+        if not channel:
+            # Optional: Try to fetch if cache misses, but be careful of rate limits in loops
+            return
+
+        try:
+            await self.update_status_embed(channel)
+        except Exception as e:
+            logger.error(f"Error in status task: {e}")
 
     @status_task.before_loop
     async def before_status_task(self):
         await self.bot.wait_until_ready()
-        print("[StatusPage] ✅ Status task started")
+        logger.info("✅ Status task started")
 
     # ─── CORE UPDATE LOGIC ─────────────────────────────────
     async def update_status_embed(self, channel: discord.TextChannel):
-        print("[StatusPage] 🔄 Updating status embed")
-
         # ─── TIME (UTC → IST) ──────────────────────────────
         now_utc = discord.utils.utcnow()
         ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -96,10 +115,7 @@ class StatusPage(commands.Cog):
         status_text = "🟢 Systems Operational"
         color = discord.Color.green()
 
-        if self.bot.status == discord.Status.dnd:
-            status_text = "🟠 Maintenance Mode"
-            color = discord.Color.orange()
-        elif cpu > 90 or ram.percent > 95:
+        if cpu > 90 or ram.percent > 95:
             status_text = "🔴 Critical System Load"
             color = discord.Color.red()
         elif ping > 800:
@@ -151,24 +167,28 @@ class StatusPage(commands.Cog):
         embed.set_footer(text=f"Refreshes every {UPDATE_INTERVAL}s | Server Time: IST")
 
         # ─── SEND / EDIT LOGIC ─────────────────────────────
+        # 1. Try to edit known message
         if self.message_id:
             try:
                 msg = await channel.fetch_message(self.message_id)
                 await msg.edit(embed=embed)
                 return
+            except discord.NotFound:
+                self.message_id = None
             except Exception:
                 self.message_id = None
 
-        async for msg in channel.history(limit=5):
+        # 2. Search history for the bot's status message
+        async for msg in channel.history(limit=10):
             if msg.author == self.bot.user and msg.embeds:
-                if msg.embeds[0].footer and "Refreshes every" in msg.embeds[0].footer.text:
+                if msg.embeds[0].footer and "Refreshes every" in str(msg.embeds[0].footer.text):
                     self.message_id = msg.id
                     await msg.edit(embed=embed)
                     return
 
+        # 3. Send new message if none found
         msg = await channel.send(embed=embed)
         self.message_id = msg.id
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(StatusPage(bot))
